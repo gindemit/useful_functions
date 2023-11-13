@@ -1,19 +1,53 @@
-/**
- * Import function triggers from their respective submodules:
- *
- * const {onCall} = require("firebase-functions/v2/https");
- * const {onDocumentWritten} = require("firebase-functions/v2/firestore");
- *
- * See a full list of supported triggers at https://firebase.google.com/docs/functions
- */
-
 const {onRequest} = require("firebase-functions/v2/https");
+const {onSchedule} = require("firebase-functions/v2/scheduler");
 const logger = require("firebase-functions/logger");
+const gaxios = require("gaxios");
+const admin = require("firebase-admin");
+const {FieldValue} = require("firebase-admin/firestore");
 
-// Create and deploy your first functions
-// https://firebase.google.com/docs/functions/get-started
+admin.initializeApp();
+const firestore = admin.firestore();
 
-// exports.helloWorld = onRequest((request, response) => {
-//   logger.info("Hello logs!", {structuredData: true});
-//   response.send("Hello from Firebase!");
-// });
+exports.collectCurrentRateAtProfeeCom = onSchedule(
+    "every 1 hours",
+    async (event) => {
+      return storeTheCurrentRateInFirestore();
+    });
+
+exports.collectCurrentRateAtProfeeComOnRequest = onRequest(
+    async (request, response) => {
+      await storeTheCurrentRateInFirestore();
+      response.send("Done");
+    });
+
+
+const storeTheCurrentRateInFirestore = async () => {
+  const profeeComUrl = "https://terminal.profee.com/api/v2/transfer/terminal/calculation";
+  const payload = {
+    from: {
+      currency: "EUR",
+      amount: 100,
+      country: 276,
+    },
+    to: {
+      currency: "RUB",
+      amount: null,
+      country: 643}};
+  try {
+    const response = await gaxios.request({
+      url: profeeComUrl,
+      method: "POST",
+      data: payload,
+    });
+    logger.info(response.data.body.currencyRate.rate);
+    const currencyRate = response.data.body.currencyRate;
+    const docRef = firestore.collection("rates").doc();
+    delete currencyRate.type;
+    await docRef.set({
+      currencyRate,
+      timestamp: FieldValue.serverTimestamp(),
+    });
+  } catch (error) {
+    logger.error(error);
+  }
+};
