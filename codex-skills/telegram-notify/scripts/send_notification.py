@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import html
 import json
 import shutil
 import subprocess
@@ -35,14 +36,40 @@ def main():
     parser.add_argument("--message", required=True)
     parser.add_argument("--url")
     parser.add_argument("--button", default="Open link")
+    parser.add_argument("--project", help="Project or task name shown above the message")
+    parser.add_argument("--status", choices=["ready", "attention", "failed", "info"], default="info")
+    parser.add_argument("--link", nargs=2, action="append", default=[], metavar=("LABEL", "URL"),
+                        help="Add a clickable link and button; repeat for more links")
+    parser.add_argument("--dry-run", action="store_true", help="Preview the payload without authentication or sending")
     args = parser.parse_args()
-    text = f"{args.title}\n\n{args.message}"
-    if not args.title.strip() or not args.message.strip() or len(text) > 4096:
-        parser.error("Title and message must be nonempty and total at most 4096 characters.")
+    links = list(args.link)
     if args.url:
-        parsed = urllib.parse.urlsplit(args.url)
+        links.insert(0, [args.button, args.url])
+    for label, url in links:
+        parsed = urllib.parse.urlsplit(url)
         if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
             parser.error("Use an HTTPS link without embedded login credentials.")
+        if not label.strip() or len(label) > 64:
+            parser.error("Link labels must contain 1 to 64 characters.")
+    icons = {"ready": "\u2705", "attention": "\U0001f514", "failed": "\u274c", "info": "\u2139\ufe0f"}
+    heading = f"{icons[args.status]} {args.title}"
+    text = f"<b>{html.escape(heading)}</b>"
+    if args.project:
+        text += f"\n<i>{html.escape(args.project)}</i>"
+    text += "\n\n" + html.escape(args.message)
+    for label, url in links:
+        text += f'\n\n<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>\n{html.escape(url)}'
+    visible = heading + ("\n" + args.project if args.project else "") + "\n\n" + args.message
+    visible += "".join(f"\n\n{label}\n{url}" for label, url in links)
+    if not args.title.strip() or not args.message.strip() or len(visible.encode("utf-16-le")) // 2 > 4096:
+        parser.error("Title and message must be nonempty and the rendered message at most 4096 characters.")
+    payload = {"chat_id": 238548435, "text": text, "parse_mode": "HTML",
+               "link_preview_options": {"is_disabled": True}}
+    if links:
+        payload["reply_markup"] = {"inline_keyboard": [[{"text": label, "url": url}] for label, url in links]}
+    if args.dry_run:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return
 
     gcloud = shutil.which("gcloud.cmd") or shutil.which("gcloud")
     if not gcloud:
@@ -67,9 +94,6 @@ def main():
     recipient = chat.get("result", {})
     if not chat.get("ok") or recipient.get("type") != "private" or recipient.get("id") != 238548435:
         raise RuntimeError("The verified private recipient could not be confirmed; nothing sent.")
-    payload = {"chat_id": 238548435, "text": text, "link_preview_options": {"is_disabled": True}}
-    if args.url:
-        payload["reply_markup"] = {"inline_keyboard": [[{"text": args.button, "url": args.url}]]}
     sent = request_json(api + "sendMessage", payload)
     if not sent.get("ok"):
         raise RuntimeError("Telegram rejected the notification.")
