@@ -78,6 +78,7 @@ def main():
         result = subprocess.run(
             [gcloud, "auth", "print-access-token", "--account=dictionarylab@gmail.com"],
             capture_output=True, text=True, timeout=30, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (subprocess.SubprocessError, OSError):
         raise RuntimeError("Could not authenticate with the local Dictionary Lab gcloud account.") from None
