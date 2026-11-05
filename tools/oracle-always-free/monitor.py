@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import random
 import subprocess
 import sys
 
@@ -14,6 +15,32 @@ DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "MediaService"
 HELPER = Path.home() / ".codex/skills/telegram-notify/scripts/send_notification.py"
 TASK = "MediaService-OCI-AlwaysFree-A1"
 FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+INTERVALS = (5, 10, 20, 30)
+GOOD_OUTCOMES = ("no_capacity", "instance_running", "instance_pending")
+
+
+def adapt(health, outcome, completed, jitter=random.uniform):
+    """Capped exponential backoff with three-check hysteresis and bounded jitter."""
+    level = min(3, max(0, health.get("backoff_level", 0)))
+    streak = health.get("clean_streak", 0)
+    if outcome in GOOD_OUTCOMES:
+        streak += 1
+        if streak >= 3:
+            level = max(0, level - 1)
+            streak = 0
+    else:
+        level = min(3, level + 1)
+        streak = 0
+        health["last_backoff_reason"] = outcome
+        if outcome == "rate_limited":
+            health["last_rate_limit"] = completed.isoformat()
+    minutes = INTERVALS[level]
+    # Randomize only elevated cooldowns, never exceed 30 minutes or go below 5.
+    delay = minutes * 60 * (jitter(0.9, 1.0) if level else 1.0)
+    # Scheduler wakes on minute boundaries. Round down so actual cooldown <= cap.
+    due = (completed + dt.timedelta(seconds=delay)).replace(second=0, microsecond=0)
+    health.update(backoff_level=level, clean_streak=streak,
+                  interval_minutes=minutes, next_check_at=due.isoformat())
 
 
 def now():
@@ -119,8 +146,10 @@ def stats(text, since):
 def classify(code, output):
     if re.search(r'NotAuthenticated|InvalidAuthenticationInfo|ExpiredToken|token.{0,30}expir|"status"\s*:\s*401\b', output, re.I):
         return "authentication_error"
+    if re.search(r'TooManyRequests|"status"\s*:\s*429\b', output):
+        return "rate_limited"
     if code:
-        return "rate_limited" if "TooManyRequests" in output else "error"
+        return "error"
     if "All availability domains are currently out of A1 capacity" in output:
         return "no_capacity"
     if "RUNNING" in output or "is running and its success notification" in output:
@@ -134,9 +163,13 @@ def check():
     with lock("oci-check") as acquired:
         if not acquired:
             return 0
-        event("started")
         path = DATA / "oci-monitor-health.json"
         health = read_json(path, {})
+        due = health.get("next_check_at")
+        if due and now() < dt.datetime.fromisoformat(due):
+            event("cooldown_skipped", next_check_at=due)
+            return 0
+        event("started")
         health["started"] = now().isoformat()
         save(path, health)
         powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
@@ -153,13 +186,15 @@ def check():
         with (DATA / "oci-monitor-output.log").open("a", encoding="utf-8") as stream:
             stream.write(now().isoformat() + "\n" + output + "\n")
         outcome = classify(code, output)
-        good = outcome in ("no_capacity", "instance_running", "instance_pending")
+        good = outcome in GOOD_OUTCOMES
         health.update(completed=now().isoformat(), outcome=outcome, exit_code=code,
                       consecutive_failures=0 if good else health.get("consecutive_failures", 0) + 1)
         if good:
             health["last_verified"] = health["completed"]
+        adapt(health, outcome, dt.datetime.fromisoformat(health["completed"]))
         save(path, health)
-        event("completed", outcome=outcome, exit_code=code)
+        event("completed", outcome=outcome, exit_code=code,
+              interval_minutes=health["interval_minutes"], next_check_at=health["next_check_at"])
         success_alert()
         if outcome == "authentication_error" or health["consecutive_failures"] >= 3:
             notify("failure-" + now().date().isoformat(), "Oracle checks need attention",
@@ -205,7 +240,11 @@ def report(force=False):
         elif stale:
             message += "ATTENTION: no verified check in over 2 hours. The computer/task or authentication needs checking."
         else:
-            message += "Monitoring is healthy. Retry interval: 30 minutes. No capacity is a successful check, not an error."
+            message += "Monitoring is healthy. No capacity is a successful check, not an error."
+        message += (f"\nAdaptive interval: {health.get('interval_minutes', 5)} minutes (5-30 minute range). "
+                    f"Clean checks toward recovery: {health.get('clean_streak', 0)}/3. "
+                    f"Next eligible check: {health.get('next_check_at', 'next scheduler wake')}. "
+                    f"Last rate limit: {health.get('last_rate_limit', 'none recorded')}.")
         failures = read_json(DATA / "oci-notifications.json", {})
         failed = sum(not item.get("delivered", False) for item in failures.values())
         if failed:

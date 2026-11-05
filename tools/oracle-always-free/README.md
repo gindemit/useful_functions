@@ -6,8 +6,9 @@ in `%LOCALAPPDATA%\MediaService`; the deployed wrapper is beside the existing sc
 
 `install.ps1` backs up the original task XML and provisioning script, installs two
 windowless `pythonw.exe` actions under the existing interactive user, and preserves the
-original provisioning trigger (30 minutes), principal and settings. It adds explicit
-RUNNING evidence before the original success email and preserves full OCI errors.
+original principal and settings. A one-minute windowless local wake checks the persisted
+cooldown; only due wakes contact Oracle. Normal checks run about every five minutes.
+It adds explicit RUNNING evidence before the original success email and preserves full OCI errors.
 It does not change shapes, regions, account type or the existing duplicate-instance guards.
 
 The independent reporter wakes hourly, sends once per calendar day at/after 20:00
@@ -32,6 +33,20 @@ authentication failure, throttling, unexpected output and incomplete runs. Detai
 captured output is in `oci-monitor-output.log`, alongside the original provisioning log.
 No-capacity responses are successful authenticated checks, not successful provisioning.
 
+The adaptive retry algorithm uses capped exponential backoff with recovery hysteresis:
+5 -> 10 -> 20 -> 30 minute levels on throttling (HTTP 429 / TooManyRequests), also backing
+off other errors instead of hammering a broken service/authentication configuration.
+Three consecutive verified, nonthrottled checks lower the interval by one level;
+another failure resets that streak. Empty capacity counts as a successful check.
+Elevated cooldowns have 0-10% downward random jitter; the normal level stays five minutes.
+Due times round down to a minute boundary so the cooldown never exceeds 30 minutes;
+observed intervals are approximate and include check duration and Windows scheduling.
+State survives process restarts/reboots; skipped wakes never contact Oracle, send
+notifications or count as capacity checks. Daily summaries include the current level,
+recovery streak, next due time and last rate-limit timestamp. Oracle's API guidance
+recommends exponential backoff on throttling; these longer minute-scale limits are the
+owner's selected capacity-check policy, separate from individual API retries.
+
 Validation: `python -m unittest discover -s tools/oracle-always-free -p test_monitor.py -v`.
 Install from Windows PowerShell with `-NoProfile -File tools/oracle-always-free/install.ps1`.
 Deploy the synchronized telegram-notify helper, including hidden gcloud subprocesses.
@@ -48,5 +63,14 @@ and its PowerShell child had a zero main-window handle. The reporting task exite
 Telegram accepted its first daily summary. An initial timestamp parsing failure during
 installation was detected by the internal-error alert and fixed before this verification.
 Provisioning success delivery is covered with simulated RUNNING evidence; no live server
-was created to test that path. Ordinary scheduling is retained at 30 minutes because
-the existing log already includes occasional launch throttling at that interval.
+was created to test that path. The original 30-minute schedule was subsequently replaced
+by the owner-requested adaptive 5-30 minute policy described above.
+
+Adaptive-policy validation: nine tests passed, including repeated throttles reaching
+the 30-minute cap, three-check recovery through each level, jitter bounds, resetting
+the recovery streak and persisted cooldown skips without starting any subprocess.
+The installed policy completed a live three-domain check successfully, persisted its
+five-minute interval and next eligible time. The following natural scheduler wake
+recorded `cooldown_skipped` and exited 0 without an Oracle check.
+Backoff itself was tested with simulated
+429 responses rather than deliberately rate-limiting the Oracle account.

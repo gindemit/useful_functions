@@ -58,7 +58,10 @@ if (-not $source.Contains('function Write-RunningInstance {')) {
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'monitor.py') -Destination (Join-Path $root 'monitor.py')
 $pythonw = (Get-Command pythonw.exe).Source
 $action = New-ScheduledTaskAction -Execute $pythonw -Argument ('"' + (Join-Path $root 'monitor.py') + '" check') -WorkingDirectory $root
-Set-ScheduledTask -TaskName $taskName -Action $action | Out-Null
+# A cheap, windowless local wake checks the persisted due time. Oracle is contacted
+# only when due, normally every five minutes and less often during backoff.
+$checkTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1).ToString('yyyy-MM-ddTHH:mm:00') -RepetitionInterval (New-TimeSpan -Minutes 1)
+Set-ScheduledTask -TaskName $taskName -Action $action -Trigger $checkTrigger | Out-Null
 
 # Hourly reporter checks the daily due marker; first send at/after 20:00 local time.
 # Independent of provisioning so a disabled/broken provisioning task is observable.
